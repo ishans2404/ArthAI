@@ -1,0 +1,1221 @@
+import asyncio
+import concurrent.futures
+import os
+import threading
+
+import httpx
+from agentd.patch import patch_openai_with_mcp
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from opensearchpy import AsyncOpenSearch
+from opensearchpy._async.http_aiohttp import AIOHttpConnection
+
+from config.embedding_constants import OPENAI_DEFAULT_EMBEDDING_MODEL
+from config.paths import get_flows_path
+from utils.container_utils import determine_docling_host, get_container_host
+from utils.embedding_fields import build_knn_vector_field
+from utils.env_utils import get_env_float, get_env_int
+from utils.logging_config import get_logger
+
+# Import configuration manager
+from .config_manager import config_manager
+
+load_dotenv(override=False)
+load_dotenv("../", override=False)
+
+logger = get_logger(__name__)
+
+# Environment variables
+OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = get_env_int("OPENSEARCH_PORT", 9200)
+OPENSEARCH_URL = f"https://{OPENSEARCH_HOST}:{OPENSEARCH_PORT}"
+
+# Optional: Langflow-specific OpenSearch endpoint
+LANGFLOW_OPENSEARCH_HOST = os.getenv("LANGFLOW_OPENSEARCH_HOST", OPENSEARCH_HOST)
+LANGFLOW_OPENSEARCH_PORT = get_env_int("LANGFLOW_OPENSEARCH_PORT", OPENSEARCH_PORT)
+
+OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME", "admin")
+OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD")
+LANGFLOW_URL = os.getenv("LANGFLOW_URL", "http://localhost:7860")
+# Optional: public URL for browser links (e.g., http://localhost:7860)
+LANGFLOW_PUBLIC_URL = os.getenv("LANGFLOW_PUBLIC_URL")
+LANGFLOW_CHAT_FLOW_ID = os.getenv("LANGFLOW_CHAT_FLOW_ID") or "1098eea1-6649-4e1d-aed1-b77249fb8dd0"
+LANGFLOW_INGEST_FLOW_ID = (
+    os.getenv("LANGFLOW_INGEST_FLOW_ID") or "5488df7c-b93f-4f87-a446-b67028bc0813"
+)
+LANGFLOW_URL_INGEST_FLOW_ID = (
+    os.getenv("LANGFLOW_URL_INGEST_FLOW_ID") or "72c3d17c-2dac-4a73-b48a-6518473d7830"
+)
+NUDGES_FLOW_ID = os.getenv("NUDGES_FLOW_ID") or "ebc01d31-1976-46ce-a385-b0240327226c"
+
+
+# Langflow superuser credentials for API key generation
+LANGFLOW_AUTO_LOGIN = os.getenv("LANGFLOW_AUTO_LOGIN", "False").lower() in ("true", "1", "yes")
+LANGFLOW_SUPERUSER = os.getenv("LANGFLOW_SUPERUSER")
+LANGFLOW_SUPERUSER_PASSWORD = os.getenv("LANGFLOW_SUPERUSER_PASSWORD")
+# Allow explicit key via environment; generation will be skipped if set
+LANGFLOW_KEY = os.getenv("LANGFLOW_KEY")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "your-secret-key-change-in-production")
+# Optional explicit JWT signing key. When set (and IBM auth is off),
+# RSA keypair generation is skipped. Read here so callers don't poke
+# os.environ directly.
+JWT_SIGNING_KEY = os.getenv("JWT_SIGNING_KEY")
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+
+# IBM AMS authentication (Watsonx Data embedded mode)
+IBM_AUTH_ENABLED = os.getenv("IBM_AUTH_ENABLED", "false").lower() in ("true", "1", "yes")
+PLATFORM_USERNAME = os.getenv("PLATFORM_USERNAME")
+PLATFORM_PASSWORD = os.getenv("PLATFORM_PASSWORD")
+OPENRAG_TENANT_ID = os.getenv("OPENRAG_TENANT_ID", "openrag")
+IBM_JWT_PUBLIC_KEY_URL = os.getenv("IBM_JWT_PUBLIC_KEY_URL", "")
+IBM_SESSION_COOKIE_NAME = os.getenv("IBM_SESSION_COOKIE_NAME", "ibm-openrag-session")
+IBM_CREDENTIALS_HEADER = os.getenv("IBM_CREDENTIALS_HEADER", "X-IBM-LH-Credentials")
+
+# ── JWT roles claim ─────────────────────────────────────────────
+# These are exposed as functions (not module constants) so they are read
+# per-call: auth/jwt_roles.py must pick up runtime overrides, and the unit
+# tests drive them via monkeypatch.setenv. This mirrors is_rbac_enforced(),
+# which reads OPENRAG_RBAC_ENFORCE the same way.
+
+
+def get_jwt_roles_claim() -> str:
+    """Name of the JWT claim that carries the user's OpenRAG roles.
+
+    The claim's value MUST be a JSON array of strings; anything else is
+    treated as no roles and rejected (HTTP 401) when JWT-role sync is active.
+    """
+    return os.getenv("OPENRAG_JWT_ROLES_CLAIM", "openrag_roles")
+
+
+# Mapping from OpenRAG built-in role -> JWT claim value. When the JWT roles
+# claim contains the returned value, the user is granted that OpenRAG role.
+# A None return (viewer, unset by default) means the OpenRAG role cannot be
+# assigned via JWT (e.g. when the IdP only ships 3 roles).
+def get_role_claim_admin() -> str:
+    return os.getenv("OPENRAG_ROLE_CLAIM_ADMIN", "admin")
+
+
+def get_role_claim_developer() -> str:
+    return os.getenv("OPENRAG_ROLE_CLAIM_DEVELOPER", "manager")
+
+
+def get_role_claim_user() -> str:
+    return os.getenv("OPENRAG_ROLE_CLAIM_USER", "user")
+
+
+def get_role_claim_viewer() -> str | None:
+    return os.getenv("OPENRAG_ROLE_CLAIM_VIEWER")
+
+
+def get_openrag_service_token() -> str | None:
+    """Platform-issued service JWT used at startup to bootstrap the OpenSearch
+    security context (admin role mapping). Read per-call — like the JWT-claim
+    accessors above — so runtime/test overrides take effect without a restart."""
+    return os.getenv("OPENRAG_SERVICE_TOKEN")
+
+
+def get_jwt_auth_header() -> str:
+    """HTTP header that may carry a gateway-forwarded JWT for /v1 (API-key)
+    callers. Read per-call so tests can override via monkeypatch.setenv."""
+    return os.getenv("OPENRAG_JWT_AUTH_HEADER", "Authorization")
+
+
+DOCLING_OCR_ENGINE = os.getenv("DOCLING_OCR_ENGINE")
+SEGMENT_WRITE_KEY = os.getenv("SEGMENT_WRITE_KEY", "")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "")
+PLATFORM_AUTH_DEV_MODE = os.getenv("PLATFORM_AUTH_DEV_MODE", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+DOCLING_SERVE_VERIFY_SSL = os.getenv("DOCLING_SERVE_VERIFY_SSL", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+
+# Skip the OpenSearch security context setup (roles, role mappings,
+# all_access admin pin). When true, OpenRAG assumes the security context
+# is managed externally (e.g., by Traefik in CPD or by a SaaS platform
+# operator).
+#
+# Default depends on OPENRAG_RUN_MODE:
+#   * saas / on_prem (CPD) -> "true" (the platform owns the security context)
+#   * anything else (oss)  -> "false" (today's behaviour preserved)
+# An explicit OPENRAG_SKIP_OS_SECURITY_SETUP value always wins, so an
+# operator can force-enable the setup in SaaS for a one-off bootstrap.
+def _resolve_skip_os_security_default() -> str:
+    run_mode = os.getenv("OPENRAG_RUN_MODE", "").strip().lower()
+    if run_mode in ("saas", "on_prem"):
+        return "true"
+    return "false"
+
+
+OPENRAG_SKIP_OS_SECURITY_SETUP = os.getenv(
+    "OPENRAG_SKIP_OS_SECURITY_SETUP", _resolve_skip_os_security_default()
+).lower() in ("true", "1", "yes")
+
+# Run setup_opensearch_security once during FastAPI lifespan startup,
+# using the admin username derived from OPENRAG_SERVICE_TOKEN. Intended
+# for platform-managed deployments (saas / on_prem) where the platform
+# issues a service token that identifies the admin user that must be
+# pinned into the all_access role mapping. Default off.
+#
+# When this flag is true the corresponding call inside startup_tasks()
+# is suppressed — bootstrap is the single source of truth on startup.
+OPENRAG_BOOTSTRAP_OS_SECURITY_ON_STARTUP = os.getenv(
+    "OPENRAG_BOOTSTRAP_OS_SECURITY_ON_STARTUP", "false"
+).lower() in ("true", "1", "yes")
+
+# Enable FastAPI's `debug` mode (verbose tracebacks in HTTP error responses
+# on the FastAPI app instance). Named explicitly so it isn't confused with
+# logging-level "debug" or other unrelated debug flags.
+#
+# Default behavior:
+#   * If FASTAPI_DEBUG is set explicitly (true/false), that wins.
+#   * Otherwise, defaults to True when LOG_LEVEL=DEBUG (developer is already
+#     opting into verbose output), False otherwise. This gives `LOG_LEVEL=DEBUG`
+#     in .env a single-knob "dev mode" effect without forcing it on in prod.
+_fastapi_debug_default = "true" if os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG" else "false"
+FASTAPI_DEBUG = os.getenv("FASTAPI_DEBUG", _fastapi_debug_default).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Whether uvicorn emits an access log line per HTTP request. On by
+# default; flip via ACCESS_LOG=false (e.g. when fronted by a load balancer
+# that already logs requests, or to reduce log noise in CI).
+ACCESS_LOG_ENABLED = os.getenv("ACCESS_LOG", "true").lower() in ("true", "1", "yes")
+
+# Number of uvicorn worker processes to allow. Multi-worker is currently
+# unsupported because the RBAC permission cache and the OAuth-subject→DB-id
+# cache are per-process; the lifespan startup hook hard-fails if this is >1
+# until the cache moves to a shared backend (Redis).
+UVICORN_WORKER_COUNT = get_env_int("UVICORN_WORKERS", 1)
+
+# Backend for the in-process RBAC permission cache. Only "memory" is wired
+# today; the lifespan hook rejects anything else.
+RBAC_CACHE_BACKEND = os.getenv("CACHE_BACKEND", "memory").lower()
+
+# TTL (seconds) for cached RBAC permission lookups. Stale permissions can
+# linger for up to this many seconds after a role mutation.
+RBAC_PERMISSION_CACHE_TTL_SECONDS = get_env_int("OPENRAG_PERM_CACHE_TTL", 60)
+
+# TTL (seconds) for the in-process JWT claims cache. A cached entry is also
+# checked against the token's own `exp` claim on every hit, so a revoked token
+# can linger at most min(this value, token_remaining_lifetime) seconds.
+JWT_CLAIMS_CACHE_TTL_SECONDS = get_env_int("OPENRAG_JWT_CACHE_TTL", 60)
+
+# Maximum number of distinct tokens kept in the JWT claims cache.
+# Each entry holds ~1 KB of claim data; 1024 entries ≈ 1 MB.
+JWT_CLAIMS_CACHE_MAX_SIZE = get_env_int("OPENRAG_JWT_CACHE_MAXSIZE", 1024)
+
+# TTL (seconds) for the in-process provider health-check response cache.
+# The banner polls GET /api/provider/health every 5-30 s per browser tab;
+# caching coalesces concurrent identical calls so watsonx round-trips are
+# not fanned out. Must be >= 1; non-positive values fall back to the default.
+_raw_phc_ttl = get_env_int("OPENRAG_PROVIDER_HEALTH_TTL", 10)
+PROVIDER_HEALTH_CACHE_TTL_SECONDS = _raw_phc_ttl if _raw_phc_ttl > 0 else 10
+
+# Docling service URL configuration
+# Priority:
+# 1. DOCLING_SERVE_URL environment variable
+# 2. Auto-detected host (container gateway, host.docker.internal, or localhost)
+_docling_url_override = os.getenv("DOCLING_SERVE_URL")
+if _docling_url_override:
+    DOCLING_SERVE_URL = _docling_url_override.rstrip("/")
+    # For health display / logging
+    DOCLING_HOST_IP = _docling_url_override
+    logger.info("Using DOCLING_SERVE_URL override: %s", DOCLING_SERVE_URL)
+else:
+    DOCLING_HOST_IP = determine_docling_host()
+    DOCLING_SERVE_URL = f"http://{DOCLING_HOST_IP}:5001"
+    logger.info("Auto-detected Docling host: %s (URL: %s)", DOCLING_HOST_IP, DOCLING_SERVE_URL)
+
+# Ingestion configuration
+DISABLE_INGEST_WITH_LANGFLOW = os.getenv("DISABLE_INGEST_WITH_LANGFLOW", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Show the "+" file upload button in the chat input
+OPENRAG_INGEST_VIA_CHAT = os.getenv("OPENRAG_INGEST_VIA_CHAT", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Ingest sample data configuration
+INGEST_SAMPLE_DATA = os.getenv("INGEST_SAMPLE_DATA", "true").lower() in ("true", "1", "yes")
+
+# Default OpenRAG docs sample ingestion source
+# - "url": crawl DEFAULT_DOCS_URL with URL ingestion flow
+# - "files": ingest files from the openrag-documents directory
+
+DEFAULT_DOCS_INGEST_SOURCE = os.getenv("DEFAULT_DOCS_INGEST_SOURCE", "url").lower()
+DEFAULT_DOCS_URL = os.getenv("DEFAULT_DOCS_URL", "https://docs.openr.ag/")
+# TODO: Enable this when the flow is updated to use the new variables
+
+DEFAULT_DOCS_CRAWL_DEPTH = get_env_int("DEFAULT_DOCS_CRAWL_DEPTH", 2)
+
+FETCH_OPENRAG_DOCS_AT_STARTUP = os.getenv("FETCH_OPENRAG_DOCS_AT_STARTUP", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Maximum number of files to upload / ingest (in batch) per task when adding knowledge via folder
+UPLOAD_BATCH_SIZE = get_env_int("UPLOAD_BATCH_SIZE", 25)
+
+# Langflow HTTP timeout configuration (in seconds)
+# For large documents (300+ pages), ingestion can take 30+ minutes
+# Default: 40 minutes total, 40 minutes read timeout
+LANGFLOW_TIMEOUT = get_env_float("LANGFLOW_TIMEOUT", 2400.0)  # 40 minutes
+LANGFLOW_CONNECT_TIMEOUT = get_env_float("LANGFLOW_CONNECT_TIMEOUT", 30.0)  # 30 seconds
+# Retries for transient Langflow HTTP failures (disconnects, 502/503/504).
+LANGFLOW_REQUEST_RETRIES = get_env_int("LANGFLOW_REQUEST_RETRIES", 2)
+
+# Per-file processing timeout for document ingestion tasks (in seconds)
+# Should be >= LANGFLOW_TIMEOUT to allow long-running ingestion to complete
+# Default: 3600 seconds (60 minutes)
+INGESTION_TIMEOUT = get_env_int("INGESTION_TIMEOUT", 3600)
+
+# Two-phase ingestion: backend-side Docling polling configuration.
+# Controls how the OpenRAG backend waits for Docling Serve to finish converting
+# a document before invoking the Langflow ingestion flow. Decoupling this poll
+# from Langflow keeps Langflow execution slots free during long Docling jobs.
+# When ENABLE_BACKEND_DOCLING_POLLING is false, the backend submits to Docling
+# and immediately invokes Langflow with the task_id; Langflow's DoclingRemote
+# component then polls Docling itself (legacy single-call behavior).
+ENABLE_BACKEND_DOCLING_POLLING = os.getenv("ENABLE_BACKEND_DOCLING_POLLING", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+DOCLING_POLL_INTERVAL_SECONDS = get_env_float("DOCLING_POLL_INTERVAL_SECONDS", 3.0)
+DOCLING_POLL_MAX_SECONDS = get_env_int("DOCLING_POLL_MAX_SECONDS", 1800)
+DOCLING_POLL_MAX_INTERVAL_SECONDS = get_env_float("DOCLING_POLL_MAX_INTERVAL_SECONDS", 30.0)
+DOCLING_POLL_BACKOFF_FACTOR = get_env_float("DOCLING_POLL_BACKOFF_FACTOR", 1.5)
+DOCLING_POLL_TRANSIENT_RETRIES = get_env_int("DOCLING_POLL_TRANSIENT_RETRIES", 5)
+
+
+def is_no_auth_mode():
+    """Check if we're running in no-auth mode (OAuth credentials missing)"""
+    if IBM_AUTH_ENABLED:
+        return False  # IBM cookie auth is a valid auth mode (variable name kept for now as per instructions)
+    result = not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET)
+    return result
+
+
+# Webhook configuration - must be set to enable webhooks
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL")  # No default - must be explicitly configured
+
+# OAuth callback broker URL -- when set, Google (and other providers) redirect
+# here instead of directly to the frontend.  The broker then forwards to the
+# actual frontend origin that is carried in the OAuth state parameter.
+OAUTH_BROKER_URL = os.getenv("OAUTH_BROKER_URL")
+
+# OpenSearch configuration
+VECTOR_DIM = 1536
+KNN_EF_CONSTRUCTION = 100
+KNN_M = 16
+
+INDEX_BODY = {
+    "settings": {
+        "index": {"knn": True},
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
+    },
+    "mappings": {
+        "properties": {
+            "document_id": {"type": "keyword"},
+            "filename": {"type": "keyword"},
+            "mimetype": {"type": "keyword"},
+            "page": {"type": "integer"},
+            "text": {"type": "text"},
+            # Legacy field - kept for backward compatibility
+            # New documents will use chunk_embedding_{model_name} fields
+            "chunk_embedding": build_knn_vector_field(VECTOR_DIM),
+            # Track which embedding model was used for this chunk
+            "embedding_model": {"type": "keyword"},
+            "source_url": {"type": "keyword"},
+            "connector_type": {"type": "keyword"},
+            "owner": {"type": "keyword"},
+            "allowed_users": {"type": "keyword"},
+            "allowed_groups": {"type": "keyword"},
+            "user_permissions": {"type": "object"},
+            "group_permissions": {"type": "object"},
+            "created_time": {"type": "date"},
+            "modified_time": {"type": "date"},
+            "indexed_time": {"type": "date"},
+            "metadata": {"type": "object"},
+        }
+    },
+}
+
+# API Keys index for public API authentication
+API_KEYS_INDEX_NAME = "api_keys"
+API_KEYS_INDEX_BODY = {
+    "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
+    },
+    "mappings": {
+        "properties": {
+            "key_id": {"type": "keyword"},
+            "key_hash": {"type": "keyword"},  # SHA-256 hash, never store plaintext
+            "key_prefix": {"type": "keyword"},  # First 8 chars for display (e.g., "orag_abc1")
+            "user_id": {"type": "keyword"},
+            "user_email": {"type": "keyword"},
+            "name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "created_at": {"type": "date"},
+            "last_used_at": {"type": "date"},
+            "revoked": {"type": "boolean"},
+        }
+    },
+}
+
+MCP_URL_PATTERNS = ("/mcp", "/streamable", "/api/v2/mcp")
+
+# Convenience base URL for Langflow REST API
+LANGFLOW_BASE_URL = f"{LANGFLOW_URL}/api/v1"
+
+
+async def get_langflow_api_key(force_regenerate: bool = False):
+    """Get the Langflow API key, generating one if needed.
+
+    Args:
+        force_regenerate: If True, generates a new key even if one is cached.
+                          Used when a request fails with 401/403 to get a fresh key.
+    """
+    global LANGFLOW_KEY
+
+    logger.debug(
+        "get_langflow_api_key called",
+        current_key_present=bool(LANGFLOW_KEY),
+        force_regenerate=force_regenerate,
+    )
+
+    # If we have a cached key and not forcing regeneration, return it
+    if LANGFLOW_KEY and not force_regenerate:
+        return LANGFLOW_KEY
+
+    # If forcing regeneration, clear the cached key
+    if force_regenerate and LANGFLOW_KEY:
+        logger.warning("[LF] Forcing Langflow API key regeneration due to auth failure")
+        LANGFLOW_KEY = None
+
+    # Use default langflow/langflow credentials if auto-login is enabled and credentials not set
+    username = LANGFLOW_SUPERUSER
+    password = LANGFLOW_SUPERUSER_PASSWORD
+
+    if LANGFLOW_AUTO_LOGIN and (not username or not password):
+        logger.info("LANGFLOW_AUTO_LOGIN is enabled, using default langflow/langflow credentials")
+        username = username or "langflow"
+        password = password or "langflow"
+
+    if not username or not password:
+        logger.warning(
+            "LANGFLOW_SUPERUSER and LANGFLOW_SUPERUSER_PASSWORD not set, skipping API key generation"
+        )
+        return None
+
+    try:
+        logger.info("Generating Langflow API key using superuser credentials")
+        max_attempts = get_env_int("LANGFLOW_KEY_RETRIES", 15)
+        delay_seconds = get_env_float("LANGFLOW_KEY_RETRY_DELAY", 2.0)
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    # Login to get access token
+                    login_response = await client.post(
+                        f"{LANGFLOW_URL}/api/v1/login",
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        data={
+                            "username": username,
+                            "password": password,
+                        },
+                    )
+                    login_response.raise_for_status()
+                    access_token = login_response.json().get("access_token")
+                    if not access_token:
+                        raise KeyError("access_token")
+
+                    # Create API key
+                    api_key_response = await client.post(
+                        f"{LANGFLOW_URL}/api/v1/api_key/",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {access_token}",
+                        },
+                        json={"name": "openrag-auto-generated"},
+                    )
+                    api_key_response.raise_for_status()
+                    api_key = api_key_response.json().get("api_key")
+                    if not api_key:
+                        raise KeyError("api_key")
+
+                    # Validate the API key works
+                    validation_response = await client.get(
+                        f"{LANGFLOW_URL}/api/v1/users/whoami",
+                        headers={"x-api-key": api_key},
+                    )
+                    if validation_response.status_code == 200:
+                        LANGFLOW_KEY = api_key
+                        logger.info(
+                            "Successfully generated and validated Langflow API key",
+                            key_prefix=api_key[:8],
+                        )
+                        return api_key
+                    else:
+                        logger.error(
+                            "Generated API key validation failed",
+                            status_code=validation_response.status_code,
+                        )
+                        raise ValueError(
+                            f"API key validation failed: {validation_response.status_code}"
+                        )
+                except (httpx.HTTPStatusError, httpx.RequestError, KeyError) as e:
+                    logger.warning(
+                        "Attempt to generate Langflow API key failed",
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        error=str(e),
+                    )
+                    if attempt < max_attempts:
+                        await asyncio.sleep(delay_seconds)
+                    else:
+                        raise
+
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        logger.error("Failed to generate Langflow API key", error=str(e))
+        return None
+    except KeyError as e:
+        logger.error("Unexpected response format from Langflow", missing_field=str(e))
+        return None
+    except Exception as e:
+        logger.error("Unexpected error generating Langflow API key", error=str(e))
+        return None
+
+
+class AppClients:
+    def __init__(self):
+        self.opensearch = None
+        self.langflow_client = None
+        self.langflow_http_client = None
+        self._patched_async_client = None  # Private attribute - single client for all providers
+        self._client_init_lock = threading.Lock()  # Lock for thread-safe initialization
+        self.docling_http_client = None
+        self._docling_service = None
+
+    async def initialize(self):
+        os_auth = None if IBM_AUTH_ENABLED else (OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD)
+
+        self.opensearch = AsyncOpenSearch(
+            hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+            connection_class=AIOHttpConnection,
+            scheme="https",
+            use_ssl=True,
+            verify_certs=False,
+            ssl_assert_fingerprint=None,
+            http_auth=os_auth,
+            http_compress=True,
+        )
+
+        # Initialize patched OpenAI client if API key is available
+        # This allows the app to start even if OPENAI_API_KEY is not set yet
+        # (e.g., when it will be provided during onboarding)
+        # The property will handle lazy initialization with probe when first accessed
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            logger.info(
+                "OpenAI API key found in environment - will be initialized lazily on first use with HTTP/2 probe"
+            )
+        else:
+            logger.info(
+                "OpenAI API key not found in environment - will be initialized on first use if needed"
+            )
+
+        # Initialize docling-serve HTTP client for document conversion
+        self.docling_http_client = httpx.AsyncClient(
+            verify=DOCLING_SERVE_VERIFY_SSL,
+            timeout=httpx.Timeout(
+                timeout=INGESTION_TIMEOUT,
+                connect=30.0,
+                read=INGESTION_TIMEOUT,
+                write=30.0,
+                pool=30.0,
+            ),
+        )
+
+        # Eagerly initialize DoclingService to ensure thread-safety
+        from services.docling_service import DoclingService
+
+        self._docling_service = DoclingService(httpx_client=self.docling_http_client)
+
+        # Initialize Langflow HTTP client with extended timeouts for large documents
+        # Must be created before wait_for_langflow / get_langflow_api_key
+        # Use explicit timeout configuration to handle large PDF ingestion (300+ pages)
+        self.langflow_http_client = httpx.AsyncClient(
+            base_url=LANGFLOW_URL,
+            timeout=httpx.Timeout(
+                timeout=LANGFLOW_TIMEOUT,  # Total timeout
+                connect=LANGFLOW_CONNECT_TIMEOUT,  # Connection timeout
+                read=LANGFLOW_TIMEOUT,  # Read timeout (most important for large PDFs)
+                write=LANGFLOW_CONNECT_TIMEOUT,  # Write timeout
+                pool=LANGFLOW_CONNECT_TIMEOUT,  # Pool timeout
+            ),
+        )
+        logger.info(
+            "Initialized Langflow HTTP client with extended timeouts",
+            timeout_seconds=LANGFLOW_TIMEOUT,
+            connect_timeout_seconds=LANGFLOW_CONNECT_TIMEOUT,
+        )
+
+        # Wait for Langflow to be healthy before generating API key
+        from utils.langflow_utils import wait_for_langflow
+
+        await wait_for_langflow(langflow_http_client=self.langflow_http_client)
+
+        # Generate Langflow API key now that Langflow is confirmed ready
+        await get_langflow_api_key()
+
+        # Initialize Langflow client with generated/provided API key
+        if LANGFLOW_KEY and self.langflow_client is None:
+            try:
+                if not OPENSEARCH_PASSWORD and not IBM_AUTH_ENABLED:
+                    raise ValueError("OPENSEARCH_PASSWORD is not set")
+                else:
+                    await self.ensure_langflow_client()
+                    # Note: OPENSEARCH_PASSWORD global variable should be created automatically
+                    # via LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT in docker-compose
+                    logger.info(
+                        "Langflow client initialized - OPENSEARCH_PASSWORD should be available via environment variables"
+                    )
+            except Exception as e:
+                logger.warning("Failed to initialize Langflow client", error=str(e))
+                self.langflow_client = None
+        if self.langflow_client is None:
+            logger.warning("No Langflow client initialized yet, will attempt later on first use")
+
+        return self
+
+    async def ensure_langflow_client(self):
+        """Ensure Langflow client exists; try to generate key and create client lazily."""
+        if self.langflow_client is not None:
+            return self.langflow_client
+        # Try generating key again (with retries)
+        await get_langflow_api_key()
+        if LANGFLOW_KEY and self.langflow_client is None:
+            try:
+                self.langflow_client = AsyncOpenAI(
+                    base_url=f"{LANGFLOW_URL}/api/v1", api_key=LANGFLOW_KEY
+                )
+                logger.info("Langflow client initialized on-demand")
+            except Exception as e:
+                logger.error("Failed to initialize Langflow client on-demand", error=str(e))
+                self.langflow_client = None
+        return self.langflow_client
+
+    @property
+    def patched_async_client(self):
+        """
+        Property that ensures OpenAI client is initialized on first access.
+        This allows lazy initialization so the app can start without an API key.
+
+        The client is patched with LiteLLM support to handle multiple providers.
+        All provider credentials are loaded into environment for LiteLLM routing.
+
+        Note: The client is a long-lived singleton that should be closed via cleanup().
+        Thread-safe via lock to prevent concurrent initialization attempts.
+        """
+        # Quick check without lock
+        if self._patched_async_client is not None:
+            return self._patched_async_client
+
+        # Use lock to ensure only one thread initializes
+        with self._client_init_lock:
+            # Double-check after acquiring lock
+            if self._patched_async_client is not None:
+                return self._patched_async_client
+
+            # Load all provider credentials into environment for LiteLLM
+            # LiteLLM routes based on model name prefixes (openai/, ollama/, watsonx/, etc.)
+            try:
+                config = get_openrag_config()
+
+                # Set OpenAI credentials
+                if config.providers.openai.api_key:
+                    os.environ["OPENAI_API_KEY"] = config.providers.openai.api_key
+                    logger.debug("Loaded OpenAI API key from config")
+                elif not os.environ.get("OPENAI_API_KEY"):
+                    # Provide dummy key to satisfy AsyncOpenAI constructor;
+                    # LiteLLM/MCP will handle routing to other providers if needed.
+                    os.environ["OPENAI_API_KEY"] = "no-key-required"
+                    logger.debug("Using dummy OpenAI API key to satisfy client constructor")
+
+                # Set Anthropic credentials
+                if config.providers.anthropic.api_key:
+                    os.environ["ANTHROPIC_API_KEY"] = config.providers.anthropic.api_key
+                    logger.debug("Loaded Anthropic API key from config")
+
+                # Set WatsonX credentials
+                if config.providers.watsonx.api_key:
+                    os.environ["WATSONX_API_KEY"] = config.providers.watsonx.api_key
+                if config.providers.watsonx.endpoint:
+                    os.environ["WATSONX_ENDPOINT"] = config.providers.watsonx.endpoint
+                    os.environ["WATSONX_API_BASE"] = (
+                        config.providers.watsonx.endpoint
+                    )  # LiteLLM expects this name
+                if config.providers.watsonx.project_id:
+                    os.environ["WATSONX_PROJECT_ID"] = config.providers.watsonx.project_id
+                if config.providers.watsonx.api_key:
+                    logger.debug("Loaded WatsonX credentials from config")
+
+                # Set Ollama endpoint
+                if config.providers.ollama.endpoint:
+                    os.environ["OLLAMA_BASE_URL"] = config.providers.ollama.endpoint
+                    os.environ["OLLAMA_ENDPOINT"] = config.providers.ollama.endpoint
+                    logger.debug("Loaded Ollama endpoint from config")
+
+                # Determine model and provider for both probe and production client
+                model_name = config.knowledge.embedding_model or OPENAI_DEFAULT_EMBEDDING_MODEL
+                provider = config.knowledge.embedding_provider or "openai"
+            except Exception as e:
+                logger.debug("Could not load provider credentials from config", error=str(e))
+                # Provide fallbacks if config loading failed
+                model_name = OPENAI_DEFAULT_EMBEDDING_MODEL
+                provider = "openai"
+                # Ensure a dummy key is available to satisfy the AsyncOpenAI constructor
+                # and avoid AuthenticationError if config loading failed.
+                if not os.environ.get("OPENAI_API_KEY"):
+                    os.environ["OPENAI_API_KEY"] = "no-key-required"
+                    logger.debug("Using dummy OpenAI API key fallback (config load failed)")
+
+            # API key for AsyncOpenAI constructor
+            api_key = os.environ.get("OPENAI_API_KEY")
+
+            async def probe_http2():
+                """Returns True if HTTP/2 works, False to fall back to HTTP/1.1.
+
+                Closes the probe client before returning so all connections are
+                drained within the probe thread's event loop.  The actual
+                production client is created after this thread exits, in the
+                caller's event loop, avoiding cross-loop SSL transport errors.
+                """
+                # Use a standard OpenAI client for the probe (only runs for OpenAI provider)
+                client = AsyncOpenAI(api_key=api_key)
+                logger.info(f"Probing client with HTTP/2 using model {model_name}...")
+                try:
+                    await asyncio.wait_for(
+                        client.embeddings.create(model=model_name, input=["test"]), timeout=5.0
+                    )
+                    logger.info(f"HTTP/2 probe successful with {model_name}")
+                    return True
+                except (TimeoutError, Exception) as probe_error:
+                    logger.warning(
+                        f"HTTP/2 probe failed with {model_name}, falling back to HTTP/1.1",
+                        error=str(probe_error),
+                    )
+                    return False
+                finally:
+                    # Always close the probe client so its connections are fully
+                    # torn down before the thread's event loop is closed.
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+
+            def run_probe_in_thread():
+                """Run the async probe in a new thread with its own event loop"""
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(probe_http2())
+                finally:
+                    loop.close()
+
+            try:
+                # Run the probe only for OpenAI provider; local and other providers
+                # (Ollama, WatsonX) typically use HTTP/1.1 for reliability.
+                if provider.lower() == "openai":
+                    # Run the probe in a separate thread with its own event loop.
+                    # Only the probe result (bool) crosses the thread boundary;
+                    # the production client is created here so its connections are
+                    # bound to the caller's event loop, not the (now closed) probe loop.
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(run_probe_in_thread)
+                        use_http2 = future.result(timeout=15)
+                else:
+                    use_http2 = False
+                    logger.debug(f"Skipping HTTP/2 probe for provider: {provider}")
+
+                if use_http2:
+                    self._patched_async_client = patch_openai_with_mcp(AsyncOpenAI(api_key=api_key))
+                    logger.info(
+                        f"OpenAI-compatible client initialized with HTTP/2 (model: {model_name})"
+                    )
+                else:
+                    http_client = httpx.AsyncClient(
+                        http2=False, timeout=httpx.Timeout(60.0, connect=10.0)
+                    )
+                    self._patched_async_client = patch_openai_with_mcp(
+                        AsyncOpenAI(api_key=api_key, http_client=http_client)
+                    )
+                    logger.info(
+                        f"OpenAI-compatible client initialized with HTTP/1.1 fallback (model: {model_name})"
+                    )
+                logger.info("Successfully initialized OpenAI client")
+            except Exception as e:
+                logger.error(
+                    f"Failed to initialize OpenAI client: {e.__class__.__name__}: {str(e)}"
+                )
+                raise ValueError(
+                    f"Failed to initialize OpenAI client: {str(e)}. Please complete onboarding or set OPENAI_API_KEY environment variable."
+                ) from e
+
+            return self._patched_async_client
+
+    @property
+    def patched_llm_client(self):
+        """Alias for patched_async_client - for backward compatibility with code expecting separate clients."""
+        return self.patched_async_client
+
+    @property
+    def patched_embedding_client(self):
+        """Alias for patched_async_client - for backward compatibility with code expecting separate clients."""
+        return self.patched_async_client
+
+    async def refresh_patched_client(self):
+        """Reset patched client so next use picks up updated provider credentials."""
+        if self._patched_async_client is not None:
+            try:
+                await self._patched_async_client.close()
+                logger.info("Closed patched client for refresh")
+            except Exception as e:
+                logger.warning("Failed to close patched client during refresh", error=str(e))
+            finally:
+                self._patched_async_client = None
+
+    @property
+    def docling_service(self):
+        """Property that ensures DoclingService is initialized."""
+        # Quick check without lock
+        if self._docling_service is not None:
+            return self._docling_service
+
+        # Use lock to ensure only one thread initializes
+        with self._client_init_lock:
+            # Double-check after acquiring lock
+            if self._docling_service is not None:
+                return self._docling_service
+
+            from services.docling_service import DoclingService
+
+            self._docling_service = DoclingService(httpx_client=self.docling_http_client)
+            return self._docling_service
+
+    async def cleanup(self):
+        """Cleanup resources - should be called on application shutdown"""
+        # Close AsyncOpenAI client if it was created
+        if self._patched_async_client is not None:
+            try:
+                await self._patched_async_client.close()
+                logger.info("Closed AsyncOpenAI client")
+            except Exception as e:
+                logger.error("Failed to close AsyncOpenAI client", error=str(e))
+            finally:
+                self._patched_async_client = None
+
+        # Close Langflow HTTP client if it exists
+        if self.langflow_http_client is not None:
+            try:
+                await self.langflow_http_client.aclose()
+                logger.info("Closed Langflow HTTP client")
+            except Exception as e:
+                logger.error("Failed to close Langflow HTTP client", error=str(e))
+            finally:
+                self.langflow_http_client = None
+
+        # Close docling-serve HTTP client if it exists
+        if self.docling_http_client is not None:
+            try:
+                await self.docling_http_client.aclose()
+                logger.info("Closed docling-serve HTTP client")
+            except Exception as e:
+                logger.error("Failed to close docling-serve HTTP client", error=str(e))
+            finally:
+                self.docling_http_client = None
+
+        # Close OpenSearch client if it exists
+        if self.opensearch is not None:
+            try:
+                await self.opensearch.close()
+                logger.info("Closed OpenSearch client")
+            except Exception as e:
+                logger.error("Failed to close OpenSearch client", error=str(e))
+            finally:
+                self.opensearch = None
+
+        # Close Langflow client if it exists (also an AsyncOpenAI client)
+        if self.langflow_client is not None:
+            try:
+                await self.langflow_client.close()
+                logger.info("Closed Langflow client")
+            except Exception as e:
+                logger.error("Failed to close Langflow client", error=str(e))
+            finally:
+                self.langflow_client = None
+
+    async def close(self):
+        """Alias for cleanup() for convenience."""
+        await self.cleanup()
+
+    async def langflow_request(self, method: str, endpoint: str, **kwargs):
+        """Central method for all Langflow API requests.
+
+        Retries transient transport/server errors and once with a fresh API key on
+        auth failures (401/403).
+        """
+        _TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+        max_attempts = max(1, LANGFLOW_REQUEST_RETRIES + 1)
+        last_error: Exception | None = None
+        auth_retry_attempted = False
+        request_kwargs = dict(kwargs)
+        passed_headers = request_kwargs.pop("headers", {}) or {}
+
+        for attempt in range(max_attempts):
+            api_key = await get_langflow_api_key()
+            if not api_key:
+                raise ValueError("No Langflow API key available")
+
+            # Merge headers properly - passed headers take precedence over defaults
+            default_headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+            headers = {**default_headers, **passed_headers}
+
+            # Remove Content-Type if explicitly set to None (for file uploads)
+            if headers.get("Content-Type") is None:
+                headers.pop("Content-Type", None)
+
+            url = f"{LANGFLOW_URL}{endpoint}"
+
+            try:
+                response = await self.langflow_http_client.request(
+                    method=method, url=url, headers=headers, **request_kwargs
+                )
+            except httpx.RequestError as exc:
+                last_error = exc
+                if attempt + 1 < max_attempts:
+                    delay = min(2**attempt, 4)
+                    logger.warning(
+                        "Langflow request transport error, retrying",
+                        endpoint=endpoint,
+                        attempt=attempt + 1,
+                        max_attempts=max_attempts,
+                        error=str(exc),
+                        retry_in_seconds=delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+            # Retry once with a fresh API key on auth failure
+            if response.status_code in (401, 403) and not auth_retry_attempted:
+                logger.warning(
+                    "Langflow request auth failed, regenerating API key and retrying",
+                    status_code=response.status_code,
+                    endpoint=endpoint,
+                )
+                auth_retry_attempted = True
+                api_key = await get_langflow_api_key(force_regenerate=True)
+                if api_key:
+                    headers["x-api-key"] = api_key
+                    try:
+                        response = await self.langflow_http_client.request(
+                            method=method, url=url, headers=headers, **request_kwargs
+                        )
+                    except httpx.RequestError as exc:
+                        last_error = exc
+                        if attempt + 1 < max_attempts:
+                            delay = min(2**attempt, 4)
+                            logger.warning(
+                                "Langflow auth retry transport error, retrying",
+                                endpoint=endpoint,
+                                attempt=attempt + 1,
+                                max_attempts=max_attempts,
+                                error=str(exc),
+                                retry_in_seconds=delay,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        raise
+
+            if response.status_code in (401, 403) and attempt + 1 < max_attempts:
+                delay = min(2**attempt, 4)
+                logger.warning(
+                    "Langflow auth failure persists, retrying request",
+                    endpoint=endpoint,
+                    status_code=response.status_code,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    retry_in_seconds=delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if response.status_code in _TRANSIENT_STATUS_CODES and attempt + 1 < max_attempts:
+                delay = min(2**attempt, 4)
+                logger.warning(
+                    "Langflow request returned transient status, retrying",
+                    endpoint=endpoint,
+                    status_code=response.status_code,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    retry_in_seconds=delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            return response
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Langflow request failed without a response")
+
+    async def _create_langflow_global_variable(self, name: str, value: str, modify: bool = False):
+        """Create a global variable in Langflow via API"""
+        payload = {
+            "name": name,
+            "value": value,
+            "default_fields": [],
+            "type": "Credential",
+        }
+
+        try:
+            response = await self.langflow_request("POST", "/api/v1/variables/", json=payload)
+
+            if response.status_code in [200, 201]:
+                logger.info(
+                    "Successfully created Langflow global variable",
+                    variable_name=name,
+                )
+            elif response.status_code == 400 and "already exists" in response.text:
+                if modify:
+                    logger.info(
+                        "Langflow global variable already exists, attempting to update",
+                        variable_name=name,
+                    )
+                    await self._update_langflow_global_variable(name, value)
+                else:
+                    logger.info(
+                        "Langflow global variable already exists",
+                        variable_name=name,
+                    )
+            else:
+                logger.warning(
+                    "Failed to create Langflow global variable",
+                    variable_name=name,
+                    status_code=response.status_code,
+                )
+        except Exception as e:
+            logger.error(
+                "Exception creating Langflow global variable",
+                variable_name=name,
+                error=str(e),
+            )
+            raise e
+
+    async def _update_langflow_global_variable(self, name: str, value: str):
+        """Update an existing global variable in Langflow via API"""
+        try:
+            # First, get all variables to find the one with the matching name
+            get_response = await self.langflow_request("GET", "/api/v1/variables/")
+
+            if get_response.status_code != 200:
+                logger.error(
+                    "Failed to retrieve variables for update",
+                    variable_name=name,
+                    status_code=get_response.status_code,
+                )
+                return
+
+            variables = get_response.json()
+            target_variable = None
+
+            # Find the variable with matching name
+            for variable in variables:
+                if variable.get("name") == name:
+                    target_variable = variable
+                    break
+
+            if not target_variable:
+                logger.error("Variable not found for update", variable_name=name)
+                return
+
+            variable_id = target_variable.get("id")
+            if not variable_id:
+                logger.error("Variable ID not found for update", variable_name=name)
+                return
+
+            # Update the variable using PATCH
+            update_payload = {
+                "id": variable_id,
+                "name": name,
+                "value": value,
+                "default_fields": target_variable.get("default_fields", []),
+            }
+
+            patch_response = await self.langflow_request(
+                "PATCH", f"/api/v1/variables/{variable_id}", json=update_payload
+            )
+
+            if patch_response.status_code == 200:
+                logger.info(
+                    "Successfully updated Langflow global variable",
+                    variable_name=name,
+                    variable_id=variable_id,
+                )
+            else:
+                logger.warning(
+                    "Failed to update Langflow global variable",
+                    variable_name=name,
+                    variable_id=variable_id,
+                    status_code=patch_response.status_code,
+                    response_text=patch_response.text,
+                )
+
+        except Exception as e:
+            logger.error(
+                "Exception updating Langflow global variable",
+                variable_name=name,
+                error=str(e),
+            )
+
+    def create_opensearch_client_from_jwt(self, jwt_token: str):
+        """Create an OpenSearch client authenticated with a JWT bearer token.
+
+        If jwt_token already contains an auth scheme (e.g. "Basic ..." or "Bearer ..."),
+        it is used verbatim. Otherwise it is wrapped as a Bearer token.
+        """
+        headers = {}
+        if isinstance(jwt_token, str) and jwt_token:
+            if jwt_token.startswith(("Basic ", "Bearer ")):
+                auth_header = jwt_token
+            else:
+                auth_header = f"Bearer {jwt_token}"
+            headers["Authorization"] = auth_header
+
+        return AsyncOpenSearch(
+            hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+            connection_class=AIOHttpConnection,
+            scheme="https",
+            use_ssl=True,
+            verify_certs=False,
+            ssl_assert_fingerprint=None,
+            headers=headers,
+            http_compress=True,
+            timeout=30,  # 30 second timeout
+            max_retries=3,
+            retry_on_timeout=True,
+        )
+
+    def create_user_opensearch_client(self, jwt_token: str):
+        """Create OpenSearch client with user's auth token."""
+        return self.create_opensearch_client_from_jwt(jwt_token)
+
+
+# Component template paths — derived from the centralized flows directory
+def _component_path(env_var: str, filename: str) -> str:
+    """Return a component path, using the env var override or the centralized flows dir."""
+    env_val = os.getenv(env_var)
+    if env_val:
+        return env_val
+    flows_dir = get_flows_path()
+    return os.path.join(flows_dir, "components", filename)
+
+
+WATSONX_LLM_COMPONENT_PATH = _component_path("WATSONX_LLM_COMPONENT_PATH", "watsonx_llm.json")
+WATSONX_LLM_TEXT_COMPONENT_PATH = _component_path(
+    "WATSONX_LLM_TEXT_COMPONENT_PATH", "watsonx_llm_text.json"
+)
+WATSONX_EMBEDDING_COMPONENT_PATH = _component_path(
+    "WATSONX_EMBEDDING_COMPONENT_PATH", "watsonx_embedding.json"
+)
+OLLAMA_LLM_COMPONENT_PATH = _component_path("OLLAMA_LLM_COMPONENT_PATH", "ollama_llm.json")
+OLLAMA_LLM_TEXT_COMPONENT_PATH = _component_path(
+    "OLLAMA_LLM_TEXT_COMPONENT_PATH", "ollama_llm_text.json"
+)
+OLLAMA_EMBEDDING_COMPONENT_PATH = _component_path(
+    "OLLAMA_EMBEDDING_COMPONENT_PATH", "ollama_embedding.json"
+)
+
+# Component IDs in flows
+
+OPENAI_EMBEDDING_COMPONENT_DISPLAY_NAME = os.getenv(
+    "OPENAI_EMBEDDING_COMPONENT_DISPLAY_NAME", "Embedding Model"
+)
+OPENAI_LLM_COMPONENT_DISPLAY_NAME = os.getenv("OPENAI_LLM_COMPONENT_DISPLAY_NAME", "Language Model")
+
+AGENT_COMPONENT_DISPLAY_NAME = os.getenv("AGENT_COMPONENT_DISPLAY_NAME", "Agent")
+
+# Provider-specific component IDs
+WATSONX_EMBEDDING_COMPONENT_DISPLAY_NAME = os.getenv(
+    "WATSONX_EMBEDDING_COMPONENT_DISPLAY_NAME", "IBM watsonx.ai Embeddings"
+)
+WATSONX_LLM_COMPONENT_DISPLAY_NAME = os.getenv(
+    "WATSONX_LLM_COMPONENT_DISPLAY_NAME", "IBM watsonx.ai"
+)
+
+OLLAMA_EMBEDDING_COMPONENT_DISPLAY_NAME = os.getenv(
+    "OLLAMA_EMBEDDING_COMPONENT_DISPLAY_NAME", "Ollama Embeddings"
+)
+OLLAMA_LLM_COMPONENT_DISPLAY_NAME = os.getenv("OLLAMA_LLM_COMPONENT_DISPLAY_NAME", "Ollama")
+
+# Docling component ID for ingest flow
+DOCLING_COMPONENT_DISPLAY_NAME = os.getenv("DOCLING_COMPONENT_DISPLAY_NAME", "Docling Serve")
+
+LOCALHOST_URL = get_container_host() or "localhost"
+
+# Global clients instance
+clients = AppClients()
+
+
+# Configuration access
+def get_openrag_config():
+    """Get current OpenRAG configuration."""
+    return config_manager.get_config()
+
+
+# Expose configuration settings for backward compatibility and easy access
+def get_provider_config():
+    """Get provider configuration."""
+    return get_openrag_config().providers
+
+
+def get_knowledge_config():
+    """Get knowledge configuration."""
+    return get_openrag_config().knowledge
+
+
+def get_agent_config():
+    """Get agent configuration."""
+    return get_openrag_config().agent
+
+
+def get_embedding_model() -> str:
+    """Return the currently configured embedding model."""
+    return get_openrag_config().knowledge.embedding_model or (
+        OPENAI_DEFAULT_EMBEDDING_MODEL
+        if get_openrag_config().knowledge.disable_ingest_with_langflow
+        else ""
+    )
+
+
+def get_index_name() -> str:
+    """Return the currently configured index name."""
+    return get_openrag_config().knowledge.index_name
